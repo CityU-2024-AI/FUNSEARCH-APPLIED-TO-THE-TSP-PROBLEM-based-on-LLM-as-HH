@@ -5,6 +5,12 @@ import logging
 import concurrent.futures
 import time
 import re
+from tenacity import (
+    retry,
+    stop_after_attempt,
+    wait_random_exponential,
+)  # for exponential backoff
+
 
 def init_client(cfg):
     global client
@@ -12,7 +18,7 @@ def init_client(cfg):
         from openai import OpenAI
         client = OpenAI()
     elif cfg.model.startswith("GLM"):
-        from zhipuai import ZhipuAI 
+        from zhipuai import ZhipuAI
         zhipu_api_key = os.getenv('ZHIPU_AI_API_KEY')
         client = ZhipuAI(api_key=zhipu_api_key)
     else:
@@ -22,6 +28,7 @@ def init_client(cfg):
 def file_to_string(filename):
     with open(filename, 'r') as file:
         return file.read()
+
 
 def filter_traceback(s):
     lines = s.split('\n')
@@ -34,6 +41,7 @@ def filter_traceback(s):
                 filtered_lines.append(lines[j])
             return '\n'.join(filtered_lines)
     return ''  # Return an empty string if no Traceback is found
+
 
 def block_until_running(stdout_filepath, log_status=False, iter_num=-1, response_id=-1):
     # Ensure that the evaluation has started before moving on
@@ -58,7 +66,8 @@ def extract_description(response: str) -> tuple[str, str]:
     return desc_string
 
 
-def multi_chat_completion(messages_list: list[list[dict]], n=1, model: str="gpt-3.5-turbo-1106", temperature: float=0.):
+def multi_chat_completion(messages_list: list[list[dict]], n=1, model: str = "gpt-3.5-turbo-1106",
+                          temperature: float = 0.):
     """
     An example of messages_list:
     
@@ -84,6 +93,11 @@ def multi_chat_completion(messages_list: list[list[dict]], n=1, model: str="gpt-
     return list(contents)
 
 
+@retry(wait=wait_random_exponential(min=1, max=60), stop=stop_after_attempt(6))
+def completion_with_backoff(**kwargs):
+    return client.chat.completions.create(**kwargs)
+
+
 def chat_completion(n: int, messages: list[dict], model: str, temperature: float) -> list[dict]:
     """
     Generate n responses using OpenAI Chat Completions API
@@ -91,10 +105,10 @@ def chat_completion(n: int, messages: list[dict], model: str, temperature: float
     total_samples = 0
     responses = []
     if "gpt-3.5" in model:
-        chunk_size = n 
+        chunk_size = n
     elif "GLM" in model:
         chunk_size = 1
-    else: 
+    else:
         chunk_size = min(4, n)
 
     while True:
@@ -103,20 +117,26 @@ def chat_completion(n: int, messages: list[dict], model: str, temperature: float
         for attempt in range(1000):
             try:
                 if "gpt" in model:
-                    response_cur = client.chat.completions.create(model=model, messages=messages, temperature=temperature, n=min(chunk_size, n-total_samples))
+                    # response_cur = client.chat.completions.create(model=model, messages=messages,
+                    #                                               temperature=temperature,
+                    #                                               n=min(chunk_size, n - total_samples))
+                    response_cur = completion_with_backoff(model=model, messages=messages,
+                                                                  temperature=temperature,
+                                                                  n=min(chunk_size, n - total_samples))
                 elif "GLM" in model:
-                    response_cur = client.chat.completions.create(model=model, messages=messages)
+                    # response_cur = client.chat.completions.create(model=model, messages=messages)
+                    response_cur = completion_with_backoff(model=model, messages=messages)
                 total_samples += chunk_size
                 break
             except Exception as e:
                 chunk_size = max(int(chunk_size / 2), 1)
                 logging.info(f"Current Chunk Size: {chunk_size}")
-                logging.info(f"Attempt {attempt+1} failed with error: {e}")
+                logging.info(f"Attempt {attempt + 1} failed with error: {e}")
                 time.sleep(1)
         if response_cur is None:
             logging.info("Code terminated due to too many failed attempts!")
             exit()
-            
+
         responses.extend(response_cur.choices)
     return responses
 
@@ -138,8 +158,8 @@ def extract_code_from_generator(content):
                 end = i
                 break
         if start is not None and end is not None:
-            code_string = '\n'.join(lines[start:end+1])
-    
+            code_string = '\n'.join(lines[start:end + 1])
+
     if code_string is None:
         return None
     # Add import statements if not present
